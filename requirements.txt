@@ -1,0 +1,11 @@
+streamlit
+langchain
+langchain-community
+langchain-huggingface
+langchain-chroma
+chromadb
+llama-cpp-python
+pypdf
+sentence-transformers
+torch
+torchvision
