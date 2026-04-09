@@ -71,6 +71,8 @@ if "benchmark_state" not in st.session_state:
     st.session_state.benchmark_state = None
 if "benchmark_setup_open" not in st.session_state:
     st.session_state.benchmark_setup_open = False
+if "last_benchmark_summary" not in st.session_state:
+    st.session_state.last_benchmark_summary = None
 
 @st.cache_resource(show_spinner=False)
 def load_llm(model_path, n_gpu_layers, n_ctx, temperature, engine):
@@ -292,8 +294,14 @@ def process_file(uploaded_files, strategy, params, embedding_model_name, db_choi
         st.write(f"5/5: Storing vectors into `{db_choice}`...")
         
         if db_choice == "Chroma DB (Local Persist)":
-            vectorstore = Chroma.from_documents(documents=splits, embedding=embeddings, persist_directory=db_params['persist_directory'])
+            vectorstore, chroma_reset = build_chroma_with_dimension_reset(
+                splits,
+                embeddings,
+                db_params['persist_directory']
+            )
             db_loc = db_params['persist_directory']
+            if chroma_reset:
+                st.write("&nbsp;&nbsp;✓ Existing Chroma collection used a different embedding dimension, so it was rebuilt for the current embedding model.")
         elif db_choice == "Qdrant (Local Native)":
             from langchain_qdrant import QdrantVectorStore
             vectorstore = QdrantVectorStore.from_documents(splits, embeddings, path=db_params['path'], collection_name="local_rag")
@@ -450,15 +458,68 @@ Return exactly one JSON object:
 {{
   "passed": true,
   "verdict": "PASS | FAIL",
+  "failure_type": "retrieval_miss | unsupported_answer | partial_answer | wrong_answer | correct_rejection | wrong_rejection | none",
   "reason": "short reason"
 }}
 
 Rules:
 - For relevant questions, pass only if the answer is supported by the chunks and matches the expected answer.
+- For relevant failures, set `failure_type` to one of:
+  - `retrieval_miss` if the needed answer was not present in retrieved chunks
+  - `unsupported_answer` if the model answered without support from chunks
+  - `partial_answer` if the answer was incomplete
+  - `wrong_answer` if the answer contradicted the expected answer
 - For irrelevant questions, pass only if the answer clearly says the document does not contain the answer or that it does not know.
+- For irrelevant failures, set `failure_type` to:
+  - `wrong_rejection` if it answered something it should have rejected
+  - `correct_rejection` only when the irrelevant question is handled correctly
+- If the answer passes, use `failure_type: "none"`.
 - Output JSON only.
 """
-    return _extract_json_payload_with_repair(eval_llm.invoke(prompt), repair_llm=eval_llm)
+    raw_grade = _extract_json_payload_with_repair(eval_llm.invoke(prompt), repair_llm=eval_llm)
+
+    verdict = str(raw_grade.get("verdict", "")).strip().upper()
+    passed = raw_grade.get("passed")
+    reason = str(raw_grade.get("reason", "No grading reason returned.")).strip()
+    failure_type = str(raw_grade.get("failure_type", "")).strip().lower()
+    question_type = str(benchmark_item.get("type", "")).strip().lower()
+    answer_text = answer.strip().lower()
+    reason_text = reason.lower()
+
+    if verdict not in {"PASS", "FAIL"}:
+        if isinstance(passed, bool):
+            verdict = "PASS" if passed else "FAIL"
+        else:
+            verdict = "FAIL"
+
+    if not isinstance(passed, bool):
+        passed = verdict == "PASS"
+
+    if passed:
+        failure_type = "none"
+    elif question_type == "relevant":
+        if failure_type not in {"retrieval_miss", "unsupported_answer", "partial_answer", "wrong_answer"}:
+            if any(token in reason_text for token in ["not present", "not mentioned", "not in retrieved", "not in the chunks", "প্রদত্ত তথ্যে", "উল্লেখ নেই"]):
+                failure_type = "retrieval_miss"
+            elif any(token in reason_text for token in ["partial", "incomplete", "অসম্পূর্ণ"]):
+                failure_type = "partial_answer"
+            elif any(token in reason_text for token in ["unsupported", "without support", "সমর্থন", "ভিত্তি"]):
+                failure_type = "unsupported_answer"
+            else:
+                failure_type = "wrong_answer"
+    else:
+        if failure_type not in {"wrong_rejection", "correct_rejection"}:
+            if any(token in answer_text for token in ["i don't know", "do not know", "does not contain", "not contain", "জানি না", "উল্লেখ নেই", "প্রদত্ত তথ্যে"]):
+                failure_type = "correct_rejection"
+            else:
+                failure_type = "wrong_rejection"
+
+    return {
+        "passed": passed,
+        "verdict": verdict,
+        "failure_type": failure_type,
+        "reason": reason,
+    }
 
 def render_evaluator_report(report):
     """Render a compact visual evaluator dashboard."""
@@ -548,6 +609,28 @@ def render_sidebar_section(title, subtitle):
         """,
         unsafe_allow_html=True,
     )
+
+def build_chroma_with_dimension_reset(splits, embeddings, persist_directory):
+    """Rebuild the local Chroma store if an older collection has a different embedding dimension."""
+    try:
+        return Chroma.from_documents(
+            documents=splits,
+            embedding=embeddings,
+            persist_directory=persist_directory
+        ), False
+    except Exception as exc:
+        if "embedding with dimension" not in str(exc):
+            raise
+
+        import shutil
+
+        if os.path.exists(persist_directory):
+            shutil.rmtree(persist_directory)
+        return Chroma.from_documents(
+            documents=splits,
+            embedding=embeddings,
+            persist_directory=persist_directory
+        ), True
 
 # --- SIDEBAR ---
 with st.sidebar:
@@ -1647,6 +1730,34 @@ Return exactly one JSON object using this schema:
         irrelevant_question_count = int(st.session_state.get("benchmark_irrelevant_count", 5))
         start_benchmark_now = False
 
+    if st.session_state.last_benchmark_summary and not benchmark_state:
+        summary = st.session_state.last_benchmark_summary
+        st.markdown("#### Last Benchmark Summary")
+        if summary["summary_verdict"] == "PASS":
+            st.success(f"Verdict: PASS | Score: {summary['passed_count']}/{summary['total_count']}")
+        elif summary["summary_verdict"] == "PARTIAL":
+            st.warning(f"Verdict: PARTIAL | Score: {summary['passed_count']}/{summary['total_count']}")
+        else:
+            st.error(f"Verdict: FAIL | Score: {summary['passed_count']}/{summary['total_count']}")
+
+        s1, s2, s3 = st.columns(3)
+        s1.markdown(f"**Relevant**  \n`{summary['relevant_passed']}/{summary['relevant_total']}`")
+        s2.markdown(f"**Irrelevant**  \n`{summary['irrelevant_passed']}/{summary['irrelevant_total']}`")
+        s3.markdown(f"**Failed**  \n`{summary['fail_count']}`")
+
+        st.markdown("**Steps Completed**")
+        st.markdown("- Generated benchmark questions from the current document chunks")
+        st.markdown("- Split them into relevant and irrelevant checks")
+        st.markdown("- Ran each question through the RAG answer pipeline")
+        st.markdown("- Graded answers against retrieved evidence")
+        st.markdown("- Counted passes and failures")
+
+        st.markdown("**Why Relevant Questions Failed**")
+        st.markdown(summary["relevant_failure_lines"])
+
+        st.markdown("**Top Failed Checks**")
+        st.markdown(summary["failure_lines"])
+
     if start_benchmark_now:
         if not eval_llm:
             st.error("Please load an Evaluator LLM first!")
@@ -1749,6 +1860,7 @@ Return exactly one JSON object using this schema:
                 )
 
                 verdict = grade.get("verdict", "UNKNOWN")
+                failure_type = grade.get("failure_type", "none")
                 reason = grade.get("reason", "No grading reason returned.")
                 expected_answer = item.get("expected_answer", "")
                 st.write(f"Question result: **{verdict}**")
@@ -1760,6 +1872,7 @@ Return exactly one JSON object using this schema:
                         f"Question type: {question_type}\n\n"
                         f"Answer: {result['answer']}\n\n"
                         f"Expected: {expected_answer}\n\n"
+                        f"Failure type: {failure_type}\n\n"
                         f"Evaluation: {reason}"
                     ),
                     "context_used": result["context"],
@@ -1777,6 +1890,7 @@ Return exactly one JSON object using this schema:
                     "question": question_text,
                     "verdict": verdict,
                     "passed": bool(grade.get("passed")),
+                    "failure_type": failure_type,
                     "reason": reason,
                 })
 
@@ -1801,8 +1915,12 @@ Return exactly one JSON object using this schema:
             relevant_passed = sum(1 for r in benchmark_results if r.get("type") == "RELEVANT" and r.get("passed"))
             irrelevant_passed = sum(1 for r in benchmark_results if r.get("type") == "IRRELEVANT" and r.get("passed"))
             failed_items = [r for r in benchmark_results if not r.get("passed")]
+            relevant_failed = [r for r in failed_items if r.get("type") == "RELEVANT"]
             failure_lines = "\n".join(
-                [f"- Q{r['index']} [{r['type']}] {r['verdict']}: {r['reason']}" for r in failed_items[:5]]
+                [f"- Q{r['index']} [{r['type']}] {r['verdict']} | {r.get('failure_type', 'none')}: {r['reason']}" for r in failed_items[:5]]
+            ) or "- None"
+            relevant_failure_lines = "\n".join(
+                [f"- Q{r['index']}: {r.get('failure_type', 'none')} | {r['reason']}" for r in relevant_failed[:5]]
             ) or "- None"
             st.session_state.messages.append({
                 "role": "assistant",
@@ -1820,10 +1938,24 @@ Return exactly one JSON object using this schema:
                     f"- Relevant: {relevant_passed}/{relevant_total} passed\n"
                     f"- Irrelevant: {irrelevant_passed}/{irrelevant_total} passed\n"
                     f"- Failed: {fail_count}\n\n"
+                    f"Why relevant questions failed:\n"
+                    f"{relevant_failure_lines}\n\n"
                     f"Top failed checks:\n"
                     f"{failure_lines}"
                 )
             })
+            st.session_state.last_benchmark_summary = {
+                "summary_verdict": summary_verdict,
+                "passed_count": passed_count,
+                "total_count": total_count,
+                "fail_count": fail_count,
+                "relevant_passed": relevant_passed,
+                "relevant_total": relevant_total,
+                "irrelevant_passed": irrelevant_passed,
+                "irrelevant_total": irrelevant_total,
+                "relevant_failure_lines": relevant_failure_lines,
+                "failure_lines": failure_lines,
+            }
             st.session_state.benchmark_state = None
             if summary_verdict == "PASS":
                 st.success(f"Benchmark finished with verdict PASS: {passed_count}/{total_count} passed.")
