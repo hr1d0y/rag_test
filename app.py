@@ -1,6 +1,25 @@
 import streamlit as st
 import os
 import tempfile
+import json
+
+_CONFIG_PATH = os.path.join(os.path.dirname(__file__), "rag_config.json")
+
+def _load_config() -> dict:
+    try:
+        with open(_CONFIG_PATH, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def _save_config(data: dict):
+    try:
+        existing = _load_config()
+        existing.update(data)
+        with open(_CONFIG_PATH, "w") as f:
+            json.dump(existing, f, indent=2)
+    except Exception:
+        pass
 
 IMPORT_ERROR = None
 try:
@@ -57,6 +76,14 @@ def ensure_ollama_running():
 ensure_ollama_running()
 
 # Initialize session state
+_cfg = _load_config()
+if "pinecone_api_key" not in st.session_state:
+    st.session_state.pinecone_api_key = _cfg.get("pinecone_api_key", "")
+if "pinecone_index_name" not in st.session_state:
+    st.session_state.pinecone_index_name = _cfg.get("pinecone_index_name", "simple-rag")
+if "pinecone_namespace" not in st.session_state:
+    st.session_state.pinecone_namespace = _cfg.get("pinecone_namespace", "")
+
 if "messages" not in st.session_state:
     st.session_state.messages = []
 if "retriever" not in st.session_state:
@@ -190,17 +217,28 @@ def process_file(uploaded_files, strategy, params, embedding_model_name, db_choi
             elif db_choice == "Milvus (Local SQLite)":
                 from langchain_milvus import Milvus
                 from pymilvus import connections
-                try:
-                    connections.connect("default", uri=db_params['uri'])
-                except Exception:
-                    pass
                 vectorstore = Milvus(
-                    embedding_function=embeddings, 
-                    connection_args={"uri": db_params['uri']}, 
+                    embedding_function=embeddings,
+                    connection_args={"uri": db_params['uri']},
                     collection_name="local_rag_hier",
-                    auto_id=True
+                    drop_old=True,
+                    auto_id=True,
                 )
+                connections.connect(alias=vectorstore.alias, uri=db_params['uri'])
                 db_loc = db_params['uri']
+            elif db_choice == "Pinecone (Cloud DB)":
+                from langchain_pinecone import PineconeVectorStore
+                from pinecone import Pinecone as _PC, ServerlessSpec
+                import time as _time
+                _pc = _PC(api_key=db_params['api_key'])
+                _dim = 4096 if "7b" in embedding_model_name else (1024 if "bge-large" in embedding_model_name else 384)
+                if db_params['index_name'] not in [i.name for i in _pc.list_indexes()]:
+                    _pc.create_index(name=db_params['index_name'], dimension=_dim, metric="cosine", spec=ServerlessSpec(cloud="aws", region="us-east-1"))
+                    while not _pc.describe_index(db_params['index_name']).status['ready']:
+                        _time.sleep(1)
+                _ns = db_params.get('namespace') or None
+                vectorstore = PineconeVectorStore(index=_pc.Index(db_params['index_name']), embedding=embeddings, namespace=_ns)
+                db_loc = f"pinecone://{db_params['index_name']}"
                 
             store = InMemoryStore()
             
@@ -309,13 +347,38 @@ def process_file(uploaded_files, strategy, params, embedding_model_name, db_choi
         elif db_choice == "Milvus (Local SQLite)":
             from langchain_milvus import Milvus
             from pymilvus import connections
-            try:
-                connections.connect("default", uri=db_params['uri'])
-            except Exception:
-                pass
-            vectorstore = Milvus.from_documents(splits, embeddings, connection_args={"uri": db_params['uri']}, collection_name="local_rag")
+            milvus_store = Milvus(
+                embedding_function=embeddings,
+                connection_args={"uri": db_params['uri']},
+                collection_name="local_rag",
+                drop_old=True,
+                auto_id=True,
+            )
+            connections.connect(alias=milvus_store.alias, uri=db_params['uri'])
+            milvus_store.add_documents(splits)
+            vectorstore = milvus_store
             db_loc = db_params['uri']
-        
+        elif db_choice == "Pinecone (Cloud DB)":
+            from langchain_pinecone import PineconeVectorStore
+            from pinecone import Pinecone as _PC, ServerlessSpec
+            import time as _time
+            _pc = _PC(api_key=db_params['api_key'])
+            _dim = 4096 if "7b" in embedding_model_name else (1024 if "bge-large" in embedding_model_name else 384)
+            if db_params['index_name'] not in [i.name for i in _pc.list_indexes()]:
+                st.write(f"&nbsp;&nbsp;⏳ Index `{db_params['index_name']}` not found. Creating a {_dim}d cosine index on Pinecone...")
+                _pc.create_index(name=db_params['index_name'], dimension=_dim, metric="cosine", spec=ServerlessSpec(cloud="aws", region="us-east-1"))
+                while not _pc.describe_index(db_params['index_name']).status['ready']:
+                    _time.sleep(1)
+                st.write(f"&nbsp;&nbsp;✓ Index `{db_params['index_name']}` created and ready.")
+            _ns = db_params.get('namespace') or None
+            vectorstore = PineconeVectorStore(
+                index=_pc.Index(db_params['index_name']),
+                embedding=embeddings,
+                namespace=_ns,
+            )
+            vectorstore.add_documents(splits)
+            db_loc = f"pinecone://{db_params['index_name']}" + (f"/{_ns}" if _ns else "")
+
         st.write(f"&nbsp;&nbsp;✓ Vectors saved securely into `{db_loc}`.")
         
         st.session_state.generated_chunks = [{"content": doc.page_content, "metadata": doc.metadata} for doc in splits]
@@ -595,16 +658,17 @@ def render_sidebar_section(title, subtitle):
     st.markdown(
         f"""
         <div style="
-            margin: 0.8rem 0 0.6rem 0;
-            padding: 0.8rem 0.85rem;
-            border-radius: 16px;
-            background: linear-gradient(135deg, rgba(255,255,255,0.96), rgba(241,245,249,0.96));
-            border: 1px solid rgba(226,232,240,0.95);
-            box-shadow: 0 10px 24px rgba(15,23,42,0.08);
+            margin: 1rem 0 0.55rem 0;
+            padding: 0.72rem 0.85rem 0.72rem 1.05rem;
+            border-radius: 14px;
+            background: linear-gradient(135deg, rgba(255,255,255,0.97), rgba(241,245,249,0.96));
+            border: 1px solid rgba(226,232,240,0.9);
+            border-left: 3px solid #10b981;
+            box-shadow: 0 4px 16px rgba(15,23,42,0.07);
         ">
-            <div style="font-size:0.78rem; text-transform:uppercase; letter-spacing:0.08em; color:#64748b; margin-bottom:0.2rem;">Section</div>
-            <div style="font-size:1rem; font-weight:700; color:#0f172a; margin-bottom:0.18rem;">{title}</div>
-            <div style="font-size:0.88rem; color:#475569;">{subtitle}</div>
+            <div style="font-size:0.72rem; text-transform:uppercase; letter-spacing:0.1em; color:#64748b; font-weight:700; margin-bottom:0.15rem;">Section</div>
+            <div style="font-size:0.97rem; font-weight:700; color:#0f172a; margin-bottom:0.14rem;">{title}</div>
+            <div style="font-size:0.82rem; color:#64748b; line-height:1.4;">{subtitle}</div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -638,51 +702,89 @@ with st.sidebar:
         """
         <style>
         .sidebar-hero {
-            padding: 1rem 0.95rem;
+            padding: 1.1rem 1rem 1rem 1rem;
             border-radius: 18px;
             background:
-                radial-gradient(circle at top right, rgba(34, 197, 94, 0.20), transparent 30%),
-                radial-gradient(circle at bottom left, rgba(59, 130, 246, 0.18), transparent 30%),
+                radial-gradient(circle at top right, rgba(34, 197, 94, 0.22), transparent 35%),
+                radial-gradient(circle at bottom left, rgba(59, 130, 246, 0.20), transparent 35%),
                 linear-gradient(140deg, #0f172a 0%, #1e293b 48%, #0b5d4b 100%);
             color: #f8fafc;
-            margin-bottom: 0.8rem;
-            box-shadow: 0 16px 36px rgba(15, 23, 42, 0.18);
+            margin-bottom: 0.75rem;
+            box-shadow: 0 16px 36px rgba(15, 23, 42, 0.22);
+            position: relative;
+            overflow: hidden;
+        }
+        .sidebar-hero-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.3rem;
+            font-size: 0.68rem;
+            text-transform: uppercase;
+            letter-spacing: 0.1em;
+            color: rgba(134, 239, 172, 0.92);
+            font-weight: 700;
+            margin-bottom: 0.42rem;
         }
         .sidebar-hero h3 {
-            margin: 0 0 0.28rem 0;
-            font-size: 1.15rem;
+            margin: 0 0 0.35rem 0;
+            font-size: 1.18rem;
             line-height: 1.05;
             letter-spacing: -0.02em;
+            font-weight: 800;
         }
         .sidebar-hero p {
             margin: 0;
-            font-size: 0.88rem;
-            color: rgba(248,250,252,0.84);
+            font-size: 0.85rem;
+            color: rgba(248,250,252,0.76);
+            line-height: 1.45;
         }
         .sidebar-flow {
             border-radius: 16px;
-            padding: 0.85rem 0.9rem;
+            padding: 0.88rem 0.92rem;
             background: linear-gradient(135deg, rgba(255,255,255,0.97), rgba(241,245,249,0.96));
             border: 1px solid rgba(226,232,240,0.95);
-            box-shadow: 0 10px 24px rgba(15,23,42,0.08);
+            box-shadow: 0 6px 20px rgba(15,23,42,0.07);
             margin-bottom: 0.75rem;
         }
         .sidebar-flow-title {
-            font-size: 0.76rem;
+            font-size: 0.70rem;
             text-transform: uppercase;
-            letter-spacing: 0.08em;
+            letter-spacing: 0.1em;
             color: #64748b;
-            margin-bottom: 0.32rem;
+            font-weight: 700;
+            margin-bottom: 0.65rem;
             display: block;
         }
-        .sidebar-flow ol {
-            margin: 0;
-            padding-left: 1rem;
-            color: #334155;
-            font-size: 0.88rem;
+        .sidebar-step {
+            display: flex;
+            align-items: flex-start;
+            gap: 0.6rem;
+            padding: 0.4rem 0;
+            border-bottom: 1px solid rgba(226,232,240,0.55);
         }
-        .sidebar-flow li {
-            margin-bottom: 0.22rem;
+        .sidebar-step:last-child {
+            border-bottom: none;
+            padding-bottom: 0;
+        }
+        .sidebar-step-num {
+            width: 21px;
+            height: 21px;
+            min-width: 21px;
+            border-radius: 50%;
+            background: linear-gradient(135deg, #1e293b, #334155);
+            color: #fff;
+            font-size: 0.66rem;
+            font-weight: 700;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin-top: 0.06rem;
+            flex-shrink: 0;
+        }
+        .sidebar-step-text {
+            font-size: 0.83rem;
+            color: #334155;
+            line-height: 1.38;
         }
         </style>
         """,
@@ -691,18 +793,32 @@ with st.sidebar:
     st.markdown(
         """
         <div class="sidebar-hero">
+            <div class="sidebar-hero-badge">&#9881; Configuration Panel</div>
             <h3>System Configuration</h3>
             <p>Set up the model, choose how documents are chunked, pick embeddings and storage, then upload files to start retrieval.</p>
         </div>
         <div class="sidebar-flow">
-            <span class="sidebar-flow-title">Recommended Order</span>
-            <ol>
-                <li>Choose your inference engine and model.</li>
-                <li>Pick a chunking strategy.</li>
-                <li>Select an embedding model.</li>
-                <li>Choose vector storage and retrieval depth.</li>
-                <li>Upload documents and start querying.</li>
-            </ol>
+            <span class="sidebar-flow-title">Recommended Setup Order</span>
+            <div class="sidebar-step">
+                <div class="sidebar-step-num">1</div>
+                <div class="sidebar-step-text">Choose inference engine &amp; model</div>
+            </div>
+            <div class="sidebar-step">
+                <div class="sidebar-step-num">2</div>
+                <div class="sidebar-step-text">Pick a chunking strategy</div>
+            </div>
+            <div class="sidebar-step">
+                <div class="sidebar-step-num">3</div>
+                <div class="sidebar-step-text">Select an embedding model</div>
+            </div>
+            <div class="sidebar-step">
+                <div class="sidebar-step-num">4</div>
+                <div class="sidebar-step-text">Choose vector storage &amp; retrieval depth</div>
+            </div>
+            <div class="sidebar-step">
+                <div class="sidebar-step-num">5</div>
+                <div class="sidebar-step-text">Upload documents &amp; start querying</div>
+            </div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -1078,7 +1194,76 @@ with st.sidebar:
     
     db_params = {}
     if db_choice == "Pinecone (Cloud DB)":
-        st.error("❌ The Pinecone architectural SDK fails to compile on Python 3.14 environments due to severe constraints inside its underlying simsimd framework limits. Pinecone is blocked natively.")
+        st.markdown(
+            """
+            <div style="
+                padding: 0.72rem 0.85rem 0.72rem 1.05rem;
+                border-radius: 14px;
+                background: linear-gradient(135deg, rgba(255,255,255,0.97), rgba(241,245,249,0.96));
+                border: 1px solid rgba(226,232,240,0.9);
+                border-left: 3px solid #6366f1;
+                margin-bottom: 0.6rem;
+            ">
+                <div style="font-size:0.72rem; text-transform:uppercase; letter-spacing:0.1em; color:#6366f1; font-weight:700; margin-bottom:0.15rem;">Cloud Vector Database</div>
+                <div style="font-size:0.9rem; font-weight:700; color:#0f172a; margin-bottom:0.12rem;">Pinecone</div>
+                <div style="font-size:0.8rem; color:#64748b; line-height:1.4;">Requires a free API key from <strong>pinecone.io</strong>. Vectors are stored in Pinecone's managed cloud — no local files needed.</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        def _save_pinecone_key():
+            st.session_state.pinecone_api_key = st.session_state._pinecone_key_input
+            _save_config({"pinecone_api_key": st.session_state.pinecone_api_key})
+        def _save_pinecone_index():
+            st.session_state.pinecone_index_name = st.session_state._pinecone_index_input
+            _save_config({"pinecone_index_name": st.session_state.pinecone_index_name})
+        def _save_pinecone_ns():
+            st.session_state.pinecone_namespace = st.session_state._pinecone_ns_input
+            _save_config({"pinecone_namespace": st.session_state.pinecone_namespace})
+
+        st.text_input(
+            "Pinecone API Key",
+            type="password",
+            placeholder="pcsk_...",
+            value=st.session_state.pinecone_api_key,
+            key="_pinecone_key_input",
+            on_change=_save_pinecone_key,
+            help="Create a free account at pinecone.io → API Keys → Create API Key",
+        )
+        st.text_input(
+            "Index Name",
+            value=st.session_state.pinecone_index_name,
+            key="_pinecone_index_input",
+            on_change=_save_pinecone_index,
+            help="Name for the Pinecone index. If it doesn't exist, it will be created automatically on upload.",
+        )
+        st.text_input(
+            "Namespace (optional)",
+            value=st.session_state.pinecone_namespace,
+            key="_pinecone_ns_input",
+            on_change=_save_pinecone_ns,
+            help="Partition vectors within the index. Leave blank to use the default namespace.",
+        )
+        db_params['api_key'] = st.session_state.pinecone_api_key
+        db_params['index_name'] = st.session_state.pinecone_index_name
+        db_params['namespace'] = st.session_state.pinecone_namespace
+        _pinecone_dim = 4096 if "7b" in selected_embedding_model else (1024 if "bge-large" in selected_embedding_model else 384)
+        st.caption(f"Index dimension required: **{_pinecone_dim}** (matches `{selected_label}` embedding model). Index will be created with `cosine` metric on AWS us-east-1 if it doesn't exist.")
+        if db_params.get('api_key'):
+            if st.button("Test Pinecone Connection", key="pinecone_test_btn"):
+                try:
+                    from pinecone import Pinecone as _PC
+                    _pc = _PC(api_key=db_params['api_key'])
+                    _index_names = [i.name for i in _pc.list_indexes()]
+                    if db_params['index_name'] in _index_names:
+                        idx_info = _pc.describe_index(db_params['index_name'])
+                        st.success(f"Connected. Index `{db_params['index_name']}` found ({idx_info.dimension}d, {idx_info.metric}).")
+                    else:
+                        st.info(f"API key valid. Index `{db_params['index_name']}` does not exist yet — it will be created automatically when you upload documents.")
+                except Exception as _e:
+                    st.error(f"Connection failed: {_e}")
+        else:
+            st.caption("Enter your API key above, then test the connection.")
     elif db_choice == "Qdrant (Local Native)":
         db_params['path'] = st.text_input("Qdrant Path", value="./qdrant_db")
         st.caption(f"Qdrant will save fast dense vectors isolated dynamically in `{db_params['path']}`.")
@@ -1110,7 +1295,8 @@ with st.sidebar:
     render_sidebar_section("Documents", "Upload source files, embed them, clear them, or inspect the generated chunks.")
     
     # Process uploads logically only if the model is ready and Database architecture doesn't fatally crash
-    if is_cached(selected_embedding_model) and db_choice != "Pinecone (Cloud DB)":
+    _pinecone_ready = db_choice != "Pinecone (Cloud DB)" or bool(db_params.get('api_key'))
+    if is_cached(selected_embedding_model) and _pinecone_ready:
         uploaded_files = st.file_uploader("Upload Documents for Vectorization", type=["pdf", "txt"], accept_multiple_files=True, key=f"uploader_{st.session_state.uploader_key}")
         
         current_file_names = sorted([f.name for f in uploaded_files]) if uploaded_files else []
