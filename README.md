@@ -1,5 +1,10 @@
 # Simple RAG App
 
+## Demo
+
+> **Add a screenshot here!** Run `streamlit run app.py`, take a screenshot of the UI, save it as `docs/screenshot.png`, and replace this line with:
+> > `![App Screenshot](docs/screenshot.png)`
+
 A local Streamlit-based RAG application for uploading documents, embedding them into a vector database, asking document-grounded questions, and evaluating answer quality.
 
 ## What It Does
