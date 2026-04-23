@@ -4,3 +4,5 @@ __pycache__/
 cmd.txt
 
 rag_config.json
+.claude/
+chat.txt

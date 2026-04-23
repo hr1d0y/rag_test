@@ -101,20 +101,174 @@ if "benchmark_setup_open" not in st.session_state:
 if "last_benchmark_summary" not in st.session_state:
     st.session_state.last_benchmark_summary = None
 
+# Cloud LLM API keys
+if "anthropic_api_key" not in st.session_state:
+    st.session_state.anthropic_api_key = _cfg.get("anthropic_api_key", "")
+if "openai_api_key" not in st.session_state:
+    st.session_state.openai_api_key = _cfg.get("openai_api_key", "")
+if "gemini_api_key" not in st.session_state:
+    st.session_state.gemini_api_key = _cfg.get("gemini_api_key", "")
+if "groq_api_key" not in st.session_state:
+    st.session_state.groq_api_key = _cfg.get("groq_api_key", "")
+
+_CLOUD_ENGINES = {"Claude (Anthropic)", "OpenAI", "Gemini (Google)", "Groq"}
+
+# Fallback lists used when API key is absent or the live fetch fails
+_CLOUD_MODELS_FALLBACK = {
+    "Claude (Anthropic)": ["claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5-20251001"],
+    "OpenAI":             ["gpt-4o", "gpt-4o-mini", "gpt-4.1", "o3", "o4-mini"],
+    "Gemini (Google)":    ["gemini-2.5-pro-preview-03-25", "gemini-2.0-flash", "gemini-1.5-pro"],
+    "Groq":               ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "mixtral-8x7b-32768"],
+}
+
+def _fetch_live_models(engine, api_key):
+    """
+    Fetch the provider's current model list via raw HTTP (no extra SDKs needed).
+    Results cached in session_state per engine+key so we only hit the network once.
+    Returns a list of model ID strings, or None on any failure.
+    Stores any error string in session_state under _cache_key + "_err".
+    """
+    import urllib.request, json as _json
+
+    _cache_key = f"_live_models_{engine}_{hash(api_key)}"
+    _err_key = _cache_key + "_err"
+    if _cache_key in st.session_state:
+        return st.session_state[_cache_key]
+
+    models = None
+    try:
+        if engine == "Claude (Anthropic)":
+            req = urllib.request.Request(
+                "https://api.anthropic.com/v1/models?limit=100",
+                headers={"x-api-key": api_key, "anthropic-version": "2023-06-01"},
+            )
+            with urllib.request.urlopen(req, timeout=8) as r:
+                data = _json.loads(r.read())
+            # Sort by creation date descending (newest first); fall back to id sort
+            items = data.get("data", [])
+            items.sort(key=lambda m: m.get("created_at", m.get("id", "")), reverse=True)
+            models = [m["id"] for m in items]
+
+        elif engine == "OpenAI":
+            req = urllib.request.Request(
+                "https://api.openai.com/v1/models",
+                headers={"Authorization": f"Bearer {api_key}"},
+            )
+            with urllib.request.urlopen(req, timeout=8) as r:
+                data = _json.loads(r.read())
+            _keep = ("gpt-4", "gpt-4o", "gpt-4.1", "o1", "o3", "o4", "chatgpt-4")
+            _skip = ("instruct", "embedding", "tts", "whisper", "dall-e",
+                     "babbage", "davinci", "ada", "curie", "search",
+                     "similarity", "code-search", "text-search", "audio-",
+                     "gpt-3.5", "gpt-4-0", "gpt-4-1106", "gpt-4-0125",
+                     "gpt-4-turbo-2024-04-09", "preview")
+            items = [
+                m for m in data.get("data", [])
+                if any(m["id"].startswith(p) for p in _keep)
+                and not any(s in m["id"] for s in _skip)
+            ]
+            # Sort by created timestamp descending (newest first)
+            items.sort(key=lambda m: m.get("created", 0), reverse=True)
+            models = [m["id"] for m in items]
+
+        elif engine == "Gemini (Google)":
+            url = f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}&pageSize=100"
+            req = urllib.request.Request(url)
+            with urllib.request.urlopen(req, timeout=8) as r:
+                data = _json.loads(r.read())
+            _skip_gemini = ("embedding", "aqa", "text-embedding", "imagen",
+                            "medlm", "palm", "bison", "gecko", "otter")
+            items = [
+                m for m in data.get("models", [])
+                if "generateContent" in m.get("supportedGenerationMethods", [])
+                and not any(s in m["name"] for s in _skip_gemini)
+            ]
+            # Prefer gemini-2 > gemini-1.5 > gemini-1 by name sort descending
+            items.sort(key=lambda m: m["name"], reverse=True)
+            models = [m["name"].replace("models/", "") for m in items]
+
+        elif engine == "Groq":
+            req = urllib.request.Request(
+                "https://api.groq.com/openai/v1/models",
+                headers={"Authorization": f"Bearer {api_key}"},
+            )
+            with urllib.request.urlopen(req, timeout=8) as r:
+                data = _json.loads(r.read())
+            _skip_groq = ("whisper", "distil-whisper", "playai", "guard")
+            items = [
+                m for m in data.get("data", [])
+                if not any(s in m["id"] for s in _skip_groq)
+            ]
+            # Sort by created timestamp descending (newest first)
+            items.sort(key=lambda m: m.get("created", 0), reverse=True)
+            models = [m["id"] for m in items]
+
+        st.session_state.pop(_err_key, None)  # clear any previous error
+
+    except Exception as _e:
+        st.session_state[_err_key] = str(_e)
+
+    if models:
+        st.session_state[_cache_key] = models
+    return models
+
+
+def _get_cloud_models(engine, api_key):
+    """Return live models if key is present and fetch succeeds, else fallback list."""
+    if api_key:
+        live = _fetch_live_models(engine, api_key)
+        if live:
+            return live, True   # (model_list, is_live)
+    return _CLOUD_MODELS_FALLBACK.get(engine, []), False
+
 @st.cache_resource(show_spinner=False)
-def load_llm(model_path, n_gpu_layers, n_ctx, temperature, engine):
-    """Load the LLM with caching."""
+def load_llm(model_path, n_gpu_layers, n_ctx, temperature, engine, api_key=""):
+    """Load the LLM with caching. Cloud engines use api_key; local engines use file path."""
     if not model_path:
         return None
-        
+
     try:
+        from langchain_core.output_parsers import StrOutputParser
+
         if engine == "Ollama (Native Service)":
             from langchain_community.llms import Ollama
-            return Ollama(
+            return Ollama(model=model_path, temperature=temperature)
+
+        elif engine == "Claude (Anthropic)":
+            from langchain_anthropic import ChatAnthropic
+            return ChatAnthropic(
                 model=model_path,
-                temperature=temperature
-            )
-        else:
+                temperature=temperature,
+                anthropic_api_key=api_key,
+                streaming=True,
+            ) | StrOutputParser()
+
+        elif engine == "OpenAI":
+            from langchain_openai import ChatOpenAI
+            return ChatOpenAI(
+                model=model_path,
+                temperature=temperature,
+                openai_api_key=api_key,
+                streaming=True,
+            ) | StrOutputParser()
+
+        elif engine == "Gemini (Google)":
+            from langchain_google_genai import ChatGoogleGenerativeAI
+            return ChatGoogleGenerativeAI(
+                model=model_path,
+                temperature=temperature,
+                google_api_key=api_key,
+            ) | StrOutputParser()
+
+        elif engine == "Groq":
+            from langchain_groq import ChatGroq
+            return ChatGroq(
+                model=model_path,
+                temperature=temperature,
+                groq_api_key=api_key,
+            ) | StrOutputParser()
+
+        else:  # Local GGUF (Llama.cpp)
             if not os.path.exists(model_path):
                 return None
             return LlamaCpp(
@@ -126,6 +280,7 @@ def load_llm(model_path, n_gpu_layers, n_ctx, temperature, engine):
                 streaming=True,
                 verbose=False,
             )
+
     except Exception as e:
         st.error(f"Error loading model: {e}")
         return None
@@ -824,13 +979,32 @@ with st.sidebar:
         unsafe_allow_html=True,
     )
     render_sidebar_section("LLM Engine", "Start here. Choose the inference backend, model source, and runtime controls.")
-    
-    # LLM Settings First
-    inference_engine = st.selectbox("LLM Inference Engine", ["Local GGUF (Llama.cpp)", "Ollama (Native Service)"])
-    
+
+    # Cloud provider metadata: (display label, key_session_var, key_url, key_placeholder)
+    _CLOUD_META = {
+        "Claude (Anthropic)": ("anthropic_api_key",  "console.anthropic.com → API Keys", "sk-ant-..."),
+        "OpenAI":             ("openai_api_key",      "platform.openai.com → API Keys",   "sk-..."),
+        "Gemini (Google)":    ("gemini_api_key",      "aistudio.google.com → API Keys",   "AIza..."),
+        "Groq":               ("groq_api_key",        "console.groq.com → API Keys",      "gsk_..."),
+    }
+
+    inference_engine = st.selectbox(
+        "LLM Inference Engine",
+        [
+            "Ollama (Native Service)",
+            "Local GGUF (Llama.cpp)",
+            "Claude (Anthropic)",
+            "OpenAI",
+            "Gemini (Google)",
+            "Groq",
+        ]
+    )
+
+    _llm_api_key = ""  # only used for cloud engines
+
     if inference_engine == "Ollama (Native Service)":
         st.caption("Ollama automatically manages Apple Silicon GPU RAM and Context sizing.")
-        
+
         # Dynamically fetch local Ollama models via internal API
         ollama_models = []
         err_msg = ""
@@ -843,28 +1017,25 @@ with st.sidebar:
             except:
                 req = urllib.request.Request("http://localhost:11434/api/tags")
                 response = urllib.request.urlopen(req, timeout=1.0)
-                
             with response:
                 models_data = json.loads(response.read().decode())
                 ollama_models = [m['name'] for m in models_data.get('models', [])]
         except Exception as e:
             err_msg = str(e)
             pass
-            
+
         if ollama_models:
             model_path = st.selectbox("Select Downloaded Ollama Model", ollama_models)
         else:
             model_path = st.text_input("Ollama Model Name (e.g. qwen2.5)", value="qwen2.5")
             st.caption(f"Auto-detect failed ({err_msg}). Make sure the Ollama app is actively open in your Mac menu bar!")
-            
+
         with st.expander("📥 Pull New Ollama Model"):
             new_ollama_model = st.text_input("Enter model tag (e.g., 'llama3.2', 'deepseek-coder-v2')", key="new_ollama_input")
-            
+
             if "ollama_pull_state" in st.session_state:
-                # Async polling state
                 q = st.session_state.ollama_pull_state['q']
                 stop_event = st.session_state.ollama_pull_state['stop_event']
-                
                 col1, col2 = st.columns([3, 1])
                 if col2.button("❌ Cancel", key="cancel_pull"):
                     stop_event.set()
@@ -873,7 +1044,6 @@ with st.sidebar:
                     import time
                     time.sleep(1)
                     st.rerun()
-                
                 import queue
                 latest_data = st.session_state.ollama_pull_state.get('last_data')
                 while not q.empty():
@@ -881,19 +1051,15 @@ with st.sidebar:
                         latest_data = q.get_nowait()
                     except queue.Empty:
                         break
-                
                 if latest_data:
                     st.session_state.ollama_pull_state['last_data'] = latest_data
-                    
                     if latest_data['type'] == 'error':
                         col1.error(f"Download failed: {latest_data['error']}")
                         del st.session_state.ollama_pull_state
                     elif latest_data['type'] == 'done':
                         col1.success(f"Successfully installed {new_ollama_model}!")
                         del st.session_state.ollama_pull_state
-                        import time
-                        time.sleep(1)
-                        st.rerun()
+                        import time; time.sleep(1); st.rerun()
                     elif latest_data['type'] == 'cancelled':
                         col1.warning("Aborted by User.")
                         if "ollama_pull_state" in st.session_state:
@@ -908,22 +1074,13 @@ with st.sidebar:
                             col1.progress(pct, text=f"**{status_str}** — {mb_done:.1f} / {mb_total:.1f} MB ({pct*100:.1f}%)")
                         else:
                             col1.info(f"Status: {status_str}")
-                            
                 if "ollama_pull_state" in st.session_state:
-                    import time
-                    time.sleep(0.1)  # Natively throttle Streamlit re-render loop
-                    st.rerun()
-                    
+                    import time; time.sleep(0.1); st.rerun()
             else:
                 if st.button("Download / Update Model", key="pull_ollama_btn") and new_ollama_model:
-                    import threading
-                    import queue
-                    import urllib.request
-                    import json
-                    
+                    import threading, queue, urllib.request, json
                     q = queue.Queue()
                     stop_event = threading.Event()
-                    
                     def pull_thread(model_name, q_ref, stop_ref):
                         try:
                             req = urllib.request.Request("http://127.0.0.1:11434/api/pull", data=json.dumps({"name": model_name}).encode('utf-8'))
@@ -931,59 +1088,136 @@ with st.sidebar:
                             with urllib.request.urlopen(req) as response:
                                 for line in response:
                                     if stop_ref.is_set():
-                                        q_ref.put({"type": "cancelled"})
-                                        return
+                                        q_ref.put({"type": "cancelled"}); return
                                     if line:
                                         q_ref.put({"type": "progress", "data": json.loads(line)})
                             q_ref.put({"type": "done"})
                         except Exception as e:
                             q_ref.put({"type": "error", "error": str(e)})
-
                     t = threading.Thread(target=pull_thread, args=(new_ollama_model.strip(), q, stop_event))
                     t.start()
-                    
                     st.session_state.ollama_pull_state = {'q': q, 'stop_event': stop_event, 'last_data': None}
                     st.rerun()
 
         temperature = st.slider("temperature", min_value=0.0, max_value=1.0, value=0.2, step=0.05)
         n_gpu_layers = -1
         n_ctx = 4096
+
+    elif inference_engine in _CLOUD_META:
+        # ── Cloud API provider ────────────────────────────────
+        _key_var, _key_url, _key_placeholder = _CLOUD_META[inference_engine]
+        _current_key = st.session_state.get(_key_var, "")
+
+        st.markdown(
+            f"""
+            <div style="
+                margin: 0.45rem 0 0.6rem 0;
+                padding: 0.62rem 0.78rem;
+                border-radius: 12px;
+                background: #f0f9ff;
+                border-left: 3px solid #0ea5e9;
+            ">
+                <div style="font-size:0.7rem; font-weight:700; text-transform:uppercase;
+                            letter-spacing:0.08em; color:#0369a1; margin-bottom:0.18rem;">
+                    Cloud API — {inference_engine}
+                </div>
+                <div style="font-size:0.78rem; color:#0c4a6e; line-height:1.45;">
+                    Get your API key at <strong>{_key_url}</strong>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        def _make_key_saver(var_name, input_key):
+            def _saver():
+                st.session_state[var_name] = st.session_state[input_key]
+                _save_config({var_name: st.session_state[var_name]})
+            return _saver
+
+        _input_key = f"_{_key_var}_input"
+        st.text_input(
+            "API Key",
+            type="password",
+            placeholder=_key_placeholder,
+            value=_current_key,
+            key=_input_key,
+            on_change=_make_key_saver(_key_var, _input_key),
+            help=f"Your API key from {_key_url}. Saved locally in rag_config.json.",
+        )
+        _llm_api_key = st.session_state.get(_key_var, "")
+
+        _avail_models, _is_live = _get_cloud_models(inference_engine, _llm_api_key)
+        _refresh_key = f"_refresh_models_{inference_engine}"
+        _ck = f"_live_models_{inference_engine}_{hash(_llm_api_key)}"
+        _err_key = _ck + "_err"
+
+        # Status badge
+        if _is_live:
+            st.markdown(
+                f'<div style="font-size:0.72rem;color:#16a34a;font-weight:600;margin-bottom:4px;">'
+                f'✓ Live — {len(_avail_models)} models fetched from API</div>',
+                unsafe_allow_html=True,
+            )
+        elif _llm_api_key:
+            _fetch_err = st.session_state.get(_err_key, "")
+            if _fetch_err:
+                st.warning(f"Fetch failed: {_fetch_err}", icon="⚠️")
+            else:
+                st.info("Showing fallback list. Hit ↻ to retry.", icon="ℹ️")
+        else:
+            st.caption("Enter your API key to load live models from the provider.")
+
+        _mc1, _mc2 = st.columns([5, 1])
+        model_path = _mc1.selectbox("Model", _avail_models)
+        if _mc2.button("↻", key=_refresh_key, help="Refresh model list from API"):
+            # Clear cached list and any error so next render re-fetches
+            for _k in (_ck, _err_key):
+                st.session_state.pop(_k, None)
+            st.rerun()
+
+        with st.expander("Advanced settings"):
+            temperature = st.slider(
+                "Creativity (temperature)",
+                min_value=0.0, max_value=1.0, value=0.2, step=0.05,
+                help="Lower = more factual and consistent. Higher = more varied responses.",
+            )
+
+        if not _llm_api_key:
+            st.warning("Enter your API key above to activate this engine.", icon="🔑")
+
+        n_gpu_layers = -1
+        n_ctx = 4096
+
     else:
+        # ── Local GGUF ────────────────────────────────────────
         model_path = st.text_input("GGUF Model Path", value="")
         n_gpu_layers = st.slider(
             "GPU Offload (n_gpu_layers)",
-            min_value=-1,
-            max_value=100,
-            value=-1,
-            help="Higher = faster if your machine has enough GPU/unified memory. Lower = safer but slower. -1 means offload as much as possible."
+            min_value=-1, max_value=100, value=-1,
+            help="Higher = faster if your machine has enough GPU/unified memory. -1 = offload as much as possible."
         )
         st.caption("Higher values try to push more of the model to GPU memory. Increase for speed, decrease if loading fails or memory gets tight.")
         n_ctx = st.slider(
             "Memory for Prompt + Context (n_ctx)",
-            min_value=512,
-            max_value=8192,
-            value=4096,
-            step=256,
+            min_value=512, max_value=8192, value=4096, step=256,
             help="Higher = the model can read more text at once, but uses more memory and can be slower."
         )
         st.caption("Increase this if long document questions lose context. Decrease it if you want lower memory usage and faster runs.")
         temperature = st.slider(
             "Answer Creativity (temperature)",
-            min_value=0.0,
-            max_value=1.0,
-            value=0.2,
-            step=0.05,
-            help="Lower = more stable and factual. Higher = more creative and varied, but more risk of drift."
+            min_value=0.0, max_value=1.0, value=0.2, step=0.05,
+            help="Lower = more stable and factual. Higher = more creative and varied."
         )
-        st.caption("For document Q&A, lower values are usually better. Raise it only if you want more flexible or exploratory wording.")
-    
+
     llm = None
-    if model_path:
+    _can_load = bool(model_path) and (inference_engine not in _CLOUD_META or bool(_llm_api_key))
+    if _can_load:
         with st.status(f"Initializing {inference_engine}...", expanded=False) as status:
-            if inference_engine != "Ollama (Native Service)":
+            if inference_engine == "Local GGUF (Llama.cpp)":
                 st.write(f"Allocating {n_gpu_layers} layers to GPU...")
                 st.write(f"Setting Context length to {n_ctx}...")
-            llm = load_llm(model_path, n_gpu_layers, n_ctx, temperature, engine=inference_engine)
+            llm = load_llm(model_path, n_gpu_layers, n_ctx, temperature, engine=inference_engine, api_key=_llm_api_key)
             if llm:
                 status.update(label="Model Loaded!", state="complete")
             else:
@@ -1732,20 +1966,36 @@ with eval_panel_col:
         unsafe_allow_html=True,
     )
     
-    eval_engine = st.selectbox("Evaluator Engine", ["Local GGUF (Llama.cpp)", "Ollama (Native Service)"], key="eval_engine")
-    
+    eval_engine = st.selectbox(
+        "Evaluator Engine",
+        ["Ollama (Native Service)", "Local GGUF (Llama.cpp)", "Claude (Anthropic)", "OpenAI", "Gemini (Google)", "Groq"],
+        key="eval_engine"
+    )
+
+    _eval_api_key = ""
     if eval_engine == "Ollama (Native Service)":
         if 'ollama_models' in locals() and ollama_models:
             eval_model_path = st.selectbox("Evaluator Model", ollama_models, key="eval_model")
         else:
             eval_model_path = st.text_input("Evaluator Model Name", value="qwen2.5", key="eval_model_text")
+    elif eval_engine in _CLOUD_META:
+        _eval_key_var, _eval_key_url, _eval_key_ph = _CLOUD_META[eval_engine]
+        _eval_api_key = st.session_state.get(_eval_key_var, "")
+        if _eval_api_key:
+            st.caption(f"Using saved {eval_engine} API key.")
+        else:
+            st.info(f"No API key found for {eval_engine}. Set it in the **LLM Engine** section of the sidebar.", icon="🔑")
+        _eval_avail, _eval_is_live = _get_cloud_models(eval_engine, _eval_api_key)
+        _eval_model_label = f"Model  ({'live — {len(_eval_avail)} available' if _eval_is_live else 'fallback — enter API key for live list'})"
+        eval_model_path = st.selectbox(_eval_model_label, _eval_avail, key="eval_model_cloud")
     else:
         eval_model_path = st.text_input("Evaluator GGUF Path", value="", key="eval_model_path")
-        
+
     eval_llm = None
-    if eval_model_path:
+    _eval_can_load = bool(eval_model_path) and (eval_engine not in _CLOUD_META or bool(_eval_api_key))
+    if _eval_can_load:
         with st.status(f"Loading Evaluator: {eval_model_path}...", expanded=False) as eval_status:
-            eval_llm = load_llm(eval_model_path, -1, 4096, 0.1, engine=eval_engine)
+            eval_llm = load_llm(eval_model_path, -1, 4096, 0.1, engine=eval_engine, api_key=_eval_api_key)
             if eval_llm:
                 eval_status.update(label="Evaluator Ready!", state="complete")
             else:
